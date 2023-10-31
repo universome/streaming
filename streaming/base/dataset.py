@@ -515,12 +515,8 @@ class StreamingDataset(Array, IterableDataset):
             os.path.join(self._filelock_root, _get_path(self._shm_prefix_int, BARRIER_FILELOCK)),
             _get_path(self._shm_prefix_int, BARRIER))
 
-        # Epoch counter.
-        #
-        # Note: we do not assume that the end of __iter__() will ever be reached, so we need to
-        # increment the epoch counter at the start of __iter__() instead of at the end, so we need
-        # to track what the next epoch is, not the current epoch.
-        self._next_epoch = SharedScalar(np.int64, _get_path(self._shm_prefix_int, NEXT_EPOCH))
+        # Epoch counter. Set initial epoch (before any resumption).
+        self.next_epoch = 0
 
         # Cache filelock. Protects downloading and evicting shards.
         self._cache_filelock_path = os.path.join(self._filelock_root,
@@ -540,11 +536,7 @@ class StreamingDataset(Array, IterableDataset):
         self._shard_access_times = SharedArray(self.num_shards, np.uint64,
                                                _get_path(self._shm_prefix_int, SHARD_ACCESS_TIMES))
 
-        # Initialize shared memory objects.
         if world.is_local_leader:
-            # Set initial epoch (before any resumption).
-            self.next_epoch = 0
-
             # Get cache usage due to streams.
             self.cache_usage = 0
             for stream in self.streams:
@@ -599,24 +591,6 @@ class StreamingDataset(Array, IterableDataset):
             int: Number of samples.
         """
         return self.num_samples
-
-    @property
-    def next_epoch(self) -> int:
-        """Get the next epoch.
-
-        Returns:
-            int: Next epoch.
-        """
-        return int(self._next_epoch.get())
-
-    @next_epoch.setter
-    def next_epoch(self, next_epoch: int) -> None:
-        """Set the next epoch.
-
-        Args:
-            next_epoch (int): Next epoch.
-        """
-        self._next_epoch.set(next_epoch)
 
     @property
     def cache_usage(self) -> int:
@@ -734,12 +708,8 @@ class StreamingDataset(Array, IterableDataset):
         presumed_epoch = self.next_epoch
         epoch, sample_in_epoch = self._resume(world, presumed_epoch)
 
-        # Wait for everyone to get the epoch above.
-        self._shared_barrier(world.workers_per_node)
-
         # Set the new next epoch.
-        if world.is_local_leader:
-            self.next_epoch = epoch + 1
+        self.next_epoch = epoch + 1
 
         return epoch, sample_in_epoch
 
@@ -942,30 +912,11 @@ class StreamingDataset(Array, IterableDataset):
         Returns:
             Optional[NDArray[np.int64]]: Our partition of the epoch.
         """
-        # Lazily create the shared barrier's FileLock, which contains a threading Lock, which is
-        # unpickleable.
-        if not hasattr(self._shared_barrier, 'lock'):
-            self._shared_barrier.lock = FileLock(self._shared_barrier.filelock_path)
-
-        # Do expensive work that may use a lot of cores/memory just once, in the local leader.
-        if world.is_local_leader:
-            epoch_sample_ids = generate_work(self.batching_method, self, world, epoch,
-                                             sample_in_epoch)
-            shape_shm, data_shm = self._share_work(epoch_sample_ids)
-            self._shared_barrier(world.workers_per_node)
-        else:
-            self._shared_barrier(world.workers_per_node)
-            epoch_sample_ids, shape_shm, data_shm = self._attach_work()
+        epoch_sample_ids = generate_work(self.batching_method, self, world, epoch, sample_in_epoch=sample_in_epoch)
 
         # Each worker gets their portion of the work.
         worker_sample_ids = epoch_sample_ids[world.node, world.rank_of_node,
                                              world.worker_of_rank].flatten()
-
-        self._shared_barrier(world.workers_per_node)
-
-        # Now clean up after ourselves.
-        shape_shm.cleanup()
-        data_shm.cleanup()
 
         return worker_sample_ids
 
