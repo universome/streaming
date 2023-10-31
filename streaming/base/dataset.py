@@ -5,6 +5,7 @@
 
 import json
 import logging
+import gc
 import mmap
 import os
 import warnings
@@ -32,7 +33,7 @@ from streaming.base.distributed import maybe_init_dist
 from streaming.base.format import get_index_basename
 from streaming.base.registry_utils import construct_from_registry
 from streaming.base.sampling import get_sampling
-from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar,
+from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar, SharedSemaphore,
                                    _get_path, get_shm_prefix)
 from streaming.base.spanner import Spanner
 from streaming.base.stream import Stream, streams_registry
@@ -312,6 +313,8 @@ class StreamingDataset(Array, IterableDataset):
         stream_name (str): The name of the Stream to use which is registered in streams_registry.
             Defaults to ``stream``.
         stream_config (dict[str, Any]): Additional arguments to pass to the Stream constructor.
+        populate_sample_id (bool): Whether to populate the ``__sample_id__`` field of the returned
+            sample.
     """
 
     def __init__(self,
@@ -340,7 +343,8 @@ class StreamingDataset(Array, IterableDataset):
                  allow_unsafe_types: bool = False,
                  replication: Optional[int] = None,
                  stream_name: str = 'stream',
-                 stream_config: Optional[dict[str, Any]] = None) -> None:
+                 stream_config: Optional[dict[str, Any]] = None,
+                 populate_sample_id: bool=False) -> None:
         # Global arguments (which do not live in Streams).
         self.predownload = predownload
         self.cache_limit = cache_limit
@@ -356,6 +360,7 @@ class StreamingDataset(Array, IterableDataset):
         self.batching_method = batching_method
         self.allow_unsafe_types = allow_unsafe_types
         self.replication = replication
+        self.populate_sample_id = populate_sample_id
 
         # Initialize the World context.
         #   * This information is for the per-rank or per-worker process.
@@ -548,12 +553,8 @@ class StreamingDataset(Array, IterableDataset):
             os.path.join(self._filelock_root, _get_path(self._shm_prefix_int, BARRIER_FILELOCK)),
             _get_path(self._shm_prefix_int, BARRIER))
 
-        # Epoch counter.
-        #
-        # Note: we do not assume that the end of __iter__() will ever be reached, so we need to
-        # increment the epoch counter at the start of __iter__() instead of at the end, so we need
-        # to track what the next epoch is, not the current epoch.
-        self._next_epoch = SharedScalar(np.int64, _get_path(self._shm_prefix_int, NEXT_EPOCH))
+        # Epoch counter. Set initial epoch (before any resumption).
+        self.next_epoch = 0
 
         # Cache filelock. Protects downloading and evicting shards.
         self._cache_filelock_path = os.path.join(self._filelock_root,
@@ -633,24 +634,6 @@ class StreamingDataset(Array, IterableDataset):
             int: Number of samples.
         """
         return self.num_samples
-
-    @property
-    def next_epoch(self) -> int:
-        """Get the next epoch.
-
-        Returns:
-            int: Next epoch.
-        """
-        return int(self._next_epoch.get())
-
-    @next_epoch.setter
-    def next_epoch(self, next_epoch: int) -> None:
-        """Set the next epoch.
-
-        Args:
-            next_epoch (int): Next epoch.
-        """
-        self._next_epoch.set(next_epoch)
 
     @property
     def cache_usage(self) -> int:
@@ -766,12 +749,8 @@ class StreamingDataset(Array, IterableDataset):
         presumed_epoch = self.next_epoch
         epoch, sample_in_epoch = self._resume(self._parallel_worker_world, presumed_epoch)
 
-        # Wait for everyone to get the epoch above.
-        self._shared_barrier(self._unique_worker_world.workers_per_node)
-
         # Set the new next epoch.
-        if self._unique_worker_world.is_local_leader:
-            self.next_epoch = epoch + 1
+        self.next_epoch = epoch + 1
 
         return epoch, sample_in_epoch
 
@@ -1019,49 +998,21 @@ class StreamingDataset(Array, IterableDataset):
         Returns:
             Optional[NDArray[np.int64]]: Our partition of the epoch.
         """
-        # Lazily create the shared barrier's FileLock, which contains a threading Lock, which is
-        # unpickleable.
-        if not hasattr(self._shared_barrier, 'lock'):
-            self._shared_barrier.lock = FileLock(self._shared_barrier.filelock_path)
-
-        u_world = self._unique_worker_world
         p_world = self._parallel_worker_world
+        max_workers_at_once = 4 if self.epoch_size > 500_000_000 else (16 if self.epoch_size > 100_000_000 else 1_000_000_000)
 
-        # Do expensive work that may use a lot of cores/memory just once, in the local leader.
-        if u_world.is_local_leader:
-            if self.replication is not None and self.replication > 1 and not u_world.worker_of_rank:
-                logger.warning(
-                    f'The `replication` arg has been set to {self.replication} and ' +
-                    f'training is resuming from sample {sample_in_epoch}. ' +
-                    f'Make sure you are accounting for sample replication when using ' +
-                    f"StreamingDataset's `state_dict` method for deterministic resumption. " +
-                    f'Otherwise, you will resume training from the wrong sample.')
-            # Ensure that batch_size is passed in, and is an integer. This is necessary for
-            # deterministic resumption and optimal performance.
-            if not isinstance(self.batch_size, int):
-                raise ValueError(f'Please pass `batch_size` to StreamingDataset. It should be ' +
-                                 f'set the same as the DataLoader, and is the number of samples ' +
-                                 f'per batch, for each device. It is necessary for ' +
-                                 f'deterministic resumption and optimal performance.')
-            epoch_sample_ids = generate_work(self.batching_method, self, p_world, epoch,
-                                             sample_in_epoch)
-            shape_shm, data_shm = self._share_work(epoch_sample_ids)
-            self._shared_barrier(u_world.workers_per_node)
-        else:
-            self._shared_barrier(u_world.workers_per_node)
-            epoch_sample_ids, shape_shm, data_shm = self._attach_work()
+        # TODO: share work across workers, e.g.:
+        # num_workers_total = world.workers_per_node
+        # work_hash = hash((self._filelock_root, self._shm_prefix_int, self.batching_method, epoch, sample_in_epoch, self.num_canonical_nodes, self.partition_algo, num_workers_total))
+        # with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once=max_workers_at_once, copy_work=True, work_hash=work_hash, num_workers_total=num_workers_total, delete_on_last_worker=True):
 
-        # Each worker gets their portion of the work.
-        worker_sample_ids = epoch_sample_ids[p_world.node, p_world.rank_of_node,
-                                             p_world.worker_of_rank].flatten()
+        with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once):
+            epoch_sample_ids = generate_work(self.batching_method, self, p_world, epoch, sample_in_epoch=sample_in_epoch)
 
-        self._shared_barrier(u_world.workers_per_node)
-
-        # Now clean up after ourselves.
-        shape_shm.cleanup()
-        # Can be None if the sample partition was empty.
-        if data_shm is not None:
-            data_shm.cleanup()
+            # Each worker gets their portion of the work.
+            worker_sample_ids = epoch_sample_ids[p_world.node, p_world.rank_of_node, p_world.worker_of_rank].flatten()
+            del epoch_sample_ids
+            gc.collect()
 
         return worker_sample_ids
 
@@ -1290,6 +1241,9 @@ class StreamingDataset(Array, IterableDataset):
                                    f'remote location or have you deleted the shard file from ' +
                                    f'the local directory?')
 
+        if sample is not None and self.populate_sample_id:
+            assert not '__sample_id__' in sample or sample['__sample_id__'] == sample_id, f'`__sample_id__` is either reserved or not unique for sample {sample_id}'
+            sample['__sample_id__'] = sample_id
         return sample
 
     def on_exception(self, future: Future) -> None:
