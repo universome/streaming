@@ -3,10 +3,7 @@
 
 """MosaicML Streaming Datasets for cloud-native model training."""
 
-import streaming.multimodal as multimodal
-import streaming.text as text
-import streaming.vision as vision
-from streaming._version import __version__  # noqa: F401
+from streaming._version import __version__
 from streaming.base import (CSVWriter, JSONWriter, LocalDataset, MDSWriter, Stream,
                             StreamingDataLoader, StreamingDataset, TSVWriter, XSVWriter)
 
@@ -20,7 +17,4 @@ __all__ = [
     'TSVWriter',
     'XSVWriter',
     'LocalDataset',
-    'multimodal',
-    'vision',
-    'text',
 ]
