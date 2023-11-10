@@ -303,6 +303,8 @@ class StreamingDataset(Array, IterableDataset):
             ``None``.
         batching_method (str): Which batching method to use, either ``random``, ``stratified``, or
             ``per_stream``. Defaults to ``random``.
+        populate_sample_id (bool): Whether to populate the ``__sample_id__`` field of the returned
+            sample.
     """
 
     def __init__(self,
@@ -327,7 +329,8 @@ class StreamingDataset(Array, IterableDataset):
                  shuffle_algo: str = 'py1e',
                  shuffle_seed: int = 9176,
                  shuffle_block_size: Optional[int] = None,
-                 batching_method: str = 'random') -> None:
+                 batching_method: str = 'random',
+                 populate_sample_id: bool=False) -> None:
         # Global arguments (which do not live in Streams).
         self.predownload = predownload
         self.cache_limit = cache_limit
@@ -341,6 +344,7 @@ class StreamingDataset(Array, IterableDataset):
         self.shuffle_seed = shuffle_seed
         self.shuffle_block_size = shuffle_block_size
         self.batching_method = batching_method
+        self.populate_sample_id = populate_sample_id
 
         # Initialize initial_physical_nodes to None. If we are resuming, then we will set it to the
         # number of physical nodes of the initial run in the _resume function.
@@ -1155,6 +1159,9 @@ class StreamingDataset(Array, IterableDataset):
                                    f'remote location or have you deleted the shard file from ' +
                                    f'the local directory?')
 
+        if sample is not None and self.populate_sample_id:
+            assert not '__sample_id__' in sample or sample['__sample_id__'] == sample_id, f'`__sample_id__` is either reserved or not unique for sample {sample_id}'
+            sample['__sample_id__'] = sample_id
         return sample
 
     def on_exception(self, future: Future) -> None:
