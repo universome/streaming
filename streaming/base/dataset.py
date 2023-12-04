@@ -5,6 +5,7 @@
 
 import json
 import logging
+import gc
 import os
 import sys
 import warnings
@@ -30,7 +31,7 @@ from streaming.base.constant import (BARRIER, BARRIER_FILELOCK, CACHE_FILELOCK, 
 from streaming.base.distributed import maybe_init_dist
 from streaming.base.format import get_index_basename
 from streaming.base.sampling import get_sampling
-from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar,
+from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar, SharedSemaphore,
                                    _get_path, get_shm_prefix)
 from streaming.base.spanner import Spanner
 from streaming.base.stream import Stream
@@ -814,7 +815,6 @@ class StreamingDataset(Array, IterableDataset):
             choose_per_stream_shard = get_sampling(samples_per_stream_shard, stream_choose,
                                                    self.sampling_granularity, self.shuffle_seed,
                                                    epoch, use_epoch)
-
             # Iterate over each shard of this stream.
             for shard_id, shard_samples, shard_choose in zip(stream_shard_ids,
                                                              samples_per_stream_shard,
@@ -916,11 +916,15 @@ class StreamingDataset(Array, IterableDataset):
         Returns:
             Optional[NDArray[np.int64]]: Our partition of the epoch.
         """
-        epoch_sample_ids = generate_work(self.batching_method, self, world, epoch, sample_in_epoch=sample_in_epoch)
+        max_workers_at_once = 4 if self.epoch_size > 500_000_000 else (16 if self.epoch_size > 100_000_000 else 1000_000)
 
-        # Each worker gets their portion of the work.
-        worker_sample_ids = epoch_sample_ids[world.node, world.rank_of_node,
-                                             world.worker_of_rank].flatten()
+        with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once):
+            epoch_sample_ids = generate_work(self.batching_method, self, world, epoch, sample_in_epoch=sample_in_epoch)
+
+            # Each worker gets their portion of the work.
+            worker_sample_ids = epoch_sample_ids[world.node, world.rank_of_node, world.worker_of_rank].flatten()
+            del epoch_sample_ids
+            gc.collect()
 
         return worker_sample_ids
 

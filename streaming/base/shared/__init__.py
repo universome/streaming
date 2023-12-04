@@ -13,5 +13,6 @@ from streaming.base.shared.memory import SharedMemory as SharedMemory
 from streaming.base.shared.prefix import _get_path as _get_path
 from streaming.base.shared.prefix import get_shm_prefix as get_shm_prefix
 from streaming.base.shared.scalar import SharedScalar as SharedScalar
+from streaming.base.shared.semaphore import SharedSemaphore
 
-__all__ = ['SharedArray', 'SharedBarrier', 'SharedMemory', 'get_shm_prefix', 'SharedScalar']
+__all__ = ['SharedArray', 'SharedBarrier', 'SharedMemory', 'get_shm_prefix', 'SharedScalar', 'SharedSemaphore']
