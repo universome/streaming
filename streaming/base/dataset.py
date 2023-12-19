@@ -916,9 +916,14 @@ class StreamingDataset(Array, IterableDataset):
         Returns:
             Optional[NDArray[np.int64]]: Our partition of the epoch.
         """
-        max_workers_at_once = 4 if self.epoch_size > 500_000_000 else (16 if self.epoch_size > 100_000_000 else 1000_000)
+        max_workers_at_once = 3 if self.epoch_size > 500_000_000 else (16 if self.epoch_size > 100_000_000 else 1_000_000_000)
 
-        with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once):
+        # TODO: share work across workers, e.g.:
+        # num_workers_total = world.workers_per_node
+        # work_hash = hash((self._filelock_root, self._shm_prefix_int, self.batching_method, epoch, sample_in_epoch, self.num_canonical_nodes, self.partition_algo, num_workers_total))
+        # with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once=max_workers_at_once, copy_work=True, work_hash=work_hash, num_workers_total=num_workers_total, delete_on_last_worker=True):
+
+        with SharedSemaphore(self._filelock_root, _get_path(self._shm_prefix_int, 'get_work_semaphore'), max_workers_at_once=max_workers_at_once):
             epoch_sample_ids = generate_work(self.batching_method, self, world, epoch, sample_in_epoch=sample_in_epoch)
 
             # Each worker gets their portion of the work.
