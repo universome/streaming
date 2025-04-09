@@ -33,8 +33,8 @@ from streaming.base.distributed import maybe_init_dist
 from streaming.base.format import get_index_basename
 from streaming.base.registry_utils import construct_from_registry
 from streaming.base.sampling import get_sampling
-from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar, SharedSemaphore,
-                                   _get_path, get_shm_prefix)
+from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar, GlobalSharedScalar,
+                                   SharedSemaphore, _get_path, get_shm_prefix)
 from streaming.base.spanner import Spanner
 from streaming.base.stream import Stream, streams_registry
 from streaming.base.util import bytes_to_int, number_abbrev_to_int
@@ -315,6 +315,8 @@ class StreamingDataset(Array, IterableDataset):
         stream_config (dict[str, Any]): Additional arguments to pass to the Stream constructor.
         populate_sample_id (bool): Whether to populate the ``__sample_id__`` field of the returned
             sample.
+        global_shm_path (str, optional): A path to the shared global shm path (typically, on a
+            shared file system) for all the workers to communicate globally to sync the epoch id.
     """
 
     def __init__(self,
@@ -344,7 +346,8 @@ class StreamingDataset(Array, IterableDataset):
                  replication: Optional[int] = None,
                  stream_name: str = 'stream',
                  stream_config: Optional[dict[str, Any]] = None,
-                 populate_sample_id: bool=False) -> None:
+                 populate_sample_id: bool=False,
+                 global_shm_path: Optional[str] = None) -> None:
         # Global arguments (which do not live in Streams).
         self.predownload = predownload
         self.cache_limit = cache_limit
@@ -361,6 +364,7 @@ class StreamingDataset(Array, IterableDataset):
         self.allow_unsafe_types = allow_unsafe_types
         self.replication = replication
         self.populate_sample_id = populate_sample_id
+        self.global_shm_path = global_shm_path
 
         # Initialize the World context.
         #   * This information is for the per-rank or per-worker process.
@@ -554,7 +558,7 @@ class StreamingDataset(Array, IterableDataset):
             _get_path(self._shm_prefix_int, BARRIER))
 
         # Epoch counter. Set initial epoch (before any resumption).
-        self.next_epoch = 0
+        self._next_epoch = SharedScalar(np.int64, _get_path(self._shm_prefix_int, NEXT_EPOCH)) if global_shm_path is None else GlobalSharedScalar(np.int64, global_shm_path, NEXT_EPOCH)
 
         # Cache filelock. Protects downloading and evicting shards.
         self._cache_filelock_path = os.path.join(self._filelock_root,
@@ -574,11 +578,12 @@ class StreamingDataset(Array, IterableDataset):
         self._shard_access_times = SharedArray(self.num_shards, np.uint64,
                                                _get_path(self._shm_prefix_int, SHARD_ACCESS_TIMES))
 
+        if self._can_update_epoch:
+            self.next_epoch = 0
+
         # Initialize shared memory objects.
         if self._unique_rank_world.is_local_leader:
             # Set initial epoch (before any resumption).
-            self.next_epoch = 0
-
             # Get cache usage due to streams.
             self.cache_usage = 0
             for stream in self.streams:
@@ -634,6 +639,34 @@ class StreamingDataset(Array, IterableDataset):
             int: Number of samples.
         """
         return self.num_samples
+
+    @property
+    def _can_update_epoch(self) -> bool:
+        if self.global_shm_path is None:
+            return self._unique_rank_world.is_local_leader
+        elif hasattr(self, '_parallel_worker_world'):
+            # If we have it, then the workers have already been initialized.
+            return self._parallel_worker_world.is_leader
+        else:
+            return self._parallel_rank_world.is_leader
+
+    @property
+    def next_epoch(self) -> int:
+        """Get the next epoch.
+
+        Returns:
+            int: Next epoch.
+        """
+        return int(self._next_epoch.get())
+
+    @next_epoch.setter
+    def next_epoch(self, next_epoch: int) -> None:
+        """Set the next epoch.
+
+        Args:
+            next_epoch (int): Next epoch.
+        """
+        self._next_epoch.set(next_epoch)
 
     @property
     def cache_usage(self) -> int:
@@ -750,7 +783,8 @@ class StreamingDataset(Array, IterableDataset):
         epoch, sample_in_epoch = self._resume(self._parallel_worker_world, presumed_epoch)
 
         # Set the new next epoch.
-        self.next_epoch = epoch + 1
+        if self._can_update_epoch:
+            self.next_epoch = epoch + 1
 
         return epoch, sample_in_epoch
 
